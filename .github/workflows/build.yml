@@ -18,10 +18,6 @@ jobs:
         with:
           fetch-depth: 2  # 获取最近两次提交
 
-      - name: Get short SHA
-        id: slug
-        run: echo "::set-output name=sha7::$(echo ${GITHUB_SHA} | cut -c1-7)"
-
     #   - name: Download previous commit
     #     uses: actions/download-artifact@v4
     #     with:
@@ -43,9 +39,13 @@ jobs:
             echo "checksum_changed=true"
           fi
 
+      - name: Rename previous checksum
+        run: |
+          mv current_checksum.txt previous_checksum.txt
+
       - name: Upload checksum
         uses: actions/upload-artifact@v4
         with:
           name: previous_checksum.txt
-          path: current_checksum.txt
+          path: previous_checksum.txt
           retention-days: 1
