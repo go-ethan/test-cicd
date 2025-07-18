@@ -18,10 +18,10 @@ jobs:
         with:
           fetch-depth: 2  # 获取最近两次提交
 
-    #   - name: Download previous commit
-    #     uses: actions/download-artifact@v4
-    #     with:
-    #       name: previous_checksum.txt
+      - name: Download previous commit
+        uses: actions/download-artifact@v4
+        with:
+          name: previous_checksum.txt
 
       - name: Build binary (current commit)
         run: |
