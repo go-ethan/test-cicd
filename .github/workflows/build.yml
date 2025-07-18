@@ -1,0 +1,50 @@
+name: build test
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    outputs:
+      checksum_changed: ${{steps.compare_checksums.outputs.checksum_changed}}
+
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 2  # 获取最近两次提交
+
+      - name: Get short SHA
+        id: slug
+        run: echo "::set-output name=sha7::$(echo ${GITHUB_SHA} | cut -c1-7)"
+
+      - name: Download previous commit
+        uses: actions/download-artifact@v4
+        with:
+          name: previous_checksum.txt
+
+      - name: Build binary (current commit)
+        run: |
+          GIT_TERMINAL_PROMPT=1 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ./bin/test ./main.go
+          sha256sum ./bin/test > current_checksum.txt
+
+      - name: Compare checksums
+        id: compare_checksums
+        run: |
+          if cmp -s current_checksum.txt previous_checksum.txt; then
+            echo "Checksums are identical. Skipping build and deploy."
+            echo "checksum_changed=false"
+          else
+            echo "Checksums are different. Proceeding with build and deploy."
+            echo "checksum_changed=true"
+          fi
+
+      - name: Upload checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: previous_checksum.txt
+          path: current_checksum.txt

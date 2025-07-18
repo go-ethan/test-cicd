@@ -1,0 +1,140 @@
+name: trading tinker
+
+on:
+  push:
+    branches: [dev]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    outputs:
+      checksum_changed: ${{steps.compare_checksums.outputs.checksum_changed}}
+
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 2  # 获取最近两次提交
+
+      - name: Get short SHA
+        id: slug
+        run: echo "::set-output name=sha7::$(echo ${GITHUB_SHA} | cut -c1-7)"
+
+      - name: Configure Git for private repos
+        run: |
+          git config --global url."https://${{ secrets.CICD_DOCKER_BUILD_PAT }}:@github.com".insteadOf "https://github.com"
+
+      - name: Check if previous commit exists
+        id: check_previous_commit
+        run: |
+          mkdir -p bin
+          if git rev-parse HEAD~1 &>/dev/null; then
+            echo "Previous commit exists."
+            echo "has_previous_commit=true" >> $GITHUB_OUTPUT
+          else
+            echo "No previous commit. This is the first commit."
+            echo "has_previous_commit=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build binary (current commit)
+        if: steps.check_previous_commit.outputs.has_previous_commit == 'true'
+        run: |
+          GIT_TERMINAL_PROMPT=1 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ./bin/tinker ./pkg/cmd/tinker/main.go
+          sha256sum ./bin/tinker > current_checksum.txt
+
+      - name: Checkout previous commit and build binary
+        if: steps.check_previous_commit.outputs.has_previous_commit == 'true'
+        run: |
+          git checkout -- .
+          git checkout HEAD~1
+          GIT_TERMINAL_PROMPT=1 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ./bin/tinker ./pkg/cmd/tinker/main.go
+          sha256sum ./bin/tinker > previous_checksum.txt
+          git checkout -- .
+          git checkout ${{ github.sha }}
+
+      - name: Compare checksums
+        id: compare_checksums
+        run: |
+          if [ "${{ steps.check_previous_commit.outputs.has_previous_commit }}" = "false" ]; then
+            echo "No previous commit. Proceeding with build and deploy."
+            echo "checksum_changed=true" >> $GITHUB_OUTPUT
+          elif cmp -s current_checksum.txt previous_checksum.txt; then
+            echo "Checksums are identical. Skipping build and deploy."
+            echo "checksum_changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "Checksums are different. Proceeding with build and deploy."
+            echo "checksum_changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.compare_checksums.outputs.checksum_changed == 'true'
+        uses: docker/setup-buildx-action@v2
+
+      - name: Auth with GCP
+        if: steps.compare_checksums.outputs.checksum_changed == 'true'
+        id: auth
+        uses: 'google-github-actions/auth@v2'
+        with:
+          workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.WORKLOAD_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_lifetime: 600s
+
+      - name: Login to Artifact Registry
+        if: steps.compare_checksums.outputs.checksum_changed == 'true'
+        uses: docker/login-action@v2
+        with:
+          registry: us-east4-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Build, tag, and push image to GCP Artifact Repository
+        if: steps.compare_checksums.outputs.checksum_changed == 'true'
+        env:
+          GAR_REGISTRY: us-east4-docker.pkg.dev/lynxlabs-internal-artifacts/lynxlabs-app
+          GAR_REPOSITORY: trading-tinker
+          IMAGE_TAG_0: ${{ github.sha }}
+          IMAGE_TAG_1: sha-${{ steps.slug.outputs.sha7 }}
+        run: |
+          docker build --build-arg GITHUB_ACCESS_TOKEN=${{ secrets.CICD_DOCKER_BUILD_PAT }} -f docker/tinker.Dockerfile -t $GAR_REGISTRY/$GAR_REPOSITORY:$IMAGE_TAG_0 -t $GAR_REGISTRY/$GAR_REPOSITORY:$IMAGE_TAG_1 .
+          docker push $GAR_REGISTRY/$GAR_REPOSITORY --all-tags
+
+  deploy:
+    name: Deploy with GitOps
+    runs-on: ubuntu-latest
+    needs: build
+    if: needs.build.outputs.checksum_changed == 'true'  # 仅在 checksum 变化时执行
+    env:
+      GITOPS_REPO: lynxlabsdev/lynx-infra-bootstrap
+
+    steps:
+      - name: Get short SHA
+        id: slug
+        run: echo "::set-output name=sha7::$(echo ${GITHUB_SHA} | cut -c1-7)"
+
+      - name: Checkout Gitops code
+        uses: actions/checkout@v2.3.3
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          fetch-depth: 1
+          token: ${{ secrets.GITOPS_REPO_PAT }}
+
+      - name: Update dev image tag - Testnet
+        uses: docker://ryanlime/kyriosctl:latest
+        with:
+          args: gitops updateTag -t sha-${{ steps.slug.outputs.sha7 }} -d app/dev/trading-tinker
+
+      - name: Commit files - Testnet
+        run: |
+          git config --local user.email "trading-bot@users.noreply.github.com"
+          git config --local user.name "Savings Bot"
+          git commit -a -m "[release][dev][trading-tinker] ${{ steps.slug.outputs.sha7 }}" -m "https://github.com/${{ github.repository }}/commit/${{ github.sha }}"
+
+      - name: Push changes
+        uses: ad-m/github-push-action@master
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          branch: main
+          github_token: ${{ secrets.GITOPS_REPO_PAT }}
